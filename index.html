@@ -70,16 +70,18 @@
 (() => {
 'use strict';
 // ---------- constants (world units; fixed 60Hz simulation) ----------
-const PW = 1000, PH = 540, M = 50;            // pitch size and surrounding margin
+const PW = 1000, PH = 534, M = 50;            // pitch size and surrounding margin
 const W = PW + 2 * M, H = PH + 2 * M, CX = W / 2, CY = H / 2;
 const L = M, R = M + PW, T = M, B = M + PH;   // pitch lines
-const GOAL_W = 160, GOAL_D = 36, POST_R = 6;
-const PR = 16, BR = 9;                        // player / ball radius
-const ACC = 0.115, P_DAMP = 0.962, B_DAMP = 0.988;
-const KICK = 6.6, KICK_REACH = 5;
+const GOAL_W = 200, GOAL_D = 36, POST_R = 6;
+const PR = 22, BR = 10.5;                        // player / ball radius
+// movement: quick to top speed (~0.5s), stops in well under a second when you let go
+const ACC = 0.282, P_DAMP = 0.937, B_DAMP = 0.9846;
+const VMAX = ACC * P_DAMP / (1 - P_DAMP);    // ~4.2 units/tick: crosses the pitch in ~4s
+const KICK = 8.3, KICK_REACH = 6;             // kicked ball leaves at about twice running speed
 const MATCH_SECS = 180;
-const CR = 70;                                // rounded pitch corner radius
-const BOOSTS = 3, BOOST_RECHARGE = 300, BOOST_REPEAT = 26, BOOST_IMP = 3.1;
+const CR = 48;                                // rounded pitch corner radius
+const BOOSTS = 3, BOOST_RECHARGE = 300, BOOST_REPEAT = 14, BOOST_IMP = 3.75;
 const CURVE = 0.022, SPIN_DECAY = 0.985;
 const DIFF = [ { speed: 0.80, noise: 0.30 }, { speed: 0.92, noise: 0.14 }, { speed: 1.0, noise: 0.04 } ];
 const POSTS = [ [L, CY - GOAL_W / 2], [L, CY + GOAL_W / 2], [R, CY - GOAL_W / 2], [R, CY + GOAL_W / 2] ];
@@ -168,7 +170,7 @@ function think(p, tick) {
   const cfg = DIFF[p.team === 0 && human ? 1 : opts.diff];
   const oppGX = dir > 0 ? R : L, ownGX = dir > 0 ? L : R;
   const d = hyp(ball.x - p.x, ball.y - p.y);
-  const lead = Math.min(d / 4.5, 22);
+  const lead = Math.min(d / 6, 18);
   const bx = clamp(ball.x + ball.vx * lead, L + BR, R - BR), by = clamp(ball.y + ball.vy * lead, T + BR, B - BR);
   const wob = Math.sin(tick * 0.05 + p.seed) * cfg.noise;     // slow aim wobble = imperfection
   let tx, ty, kick = false, sprint = false;
@@ -293,6 +295,8 @@ function step(tick) {
       p.boosts--; p.boostCd = BOOST_REPEAT; p.boostFx = 14;
     }
     p.vx = (p.vx + ix * ACC) * P_DAMP; p.vy = (p.vy + iy * ACC) * P_DAMP;
+    const sp = hyp(p.vx, p.vy);                                      // boost speed bleeds off fast
+    if (sp > VMAX) { const k = (VMAX + (sp - VMAX) * 0.9) / sp; p.vx *= k; p.vy *= k; }
     p.x += p.vx; p.y += p.vy;
     if (p.cool > 0) p.cool--; if (p.kickFx > 0) p.kickFx--;
   }
@@ -362,8 +366,8 @@ function draw() {
   ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.roundRect(L, T, PW, PH, CR); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(CX, T); ctx.lineTo(CX, B); ctx.stroke();
-  ctx.beginPath(); ctx.arc(CX, CY, 70, 0, 7); ctx.stroke();
-  ctx.strokeRect(L, CY - 130, 110, 260); ctx.strokeRect(R - 110, CY - 130, 110, 260);
+  ctx.beginPath(); ctx.arc(CX, CY, 89, 0, 7); ctx.stroke();
+  ctx.strokeRect(L, CY - 154, 156, 308); ctx.strokeRect(R - 156, CY - 154, 156, 308);
   // goals
   for (const s of [-1, 1]) {
     const x = s < 0 ? L - GOAL_D : R;
@@ -372,7 +376,7 @@ function draw() {
   }
   ctx.fillStyle = '#fff'; for (const [px, py] of POSTS) { ctx.beginPath(); ctx.arc(px, py, POST_R, 0, 7); ctx.fill(); }
   // players
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = 'bold 14px system-ui,sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = 'bold 15px system-ui,sans-serif';
   for (const p of players) {
     if (p.boostFx > 0) { ctx.strokeStyle = `rgba(255,255,255,${p.boostFx / 20})`; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 7, p.y - p.vy * 7); ctx.stroke(); }
     ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.ellipse(p.x + 2, p.y + 4, PR, PR * 0.85, 0, 0, 7); ctx.fill();
