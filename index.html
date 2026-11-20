@@ -60,7 +60,7 @@
         <button class="go" id="start">Kick off</button>
         <div class="keys">
           <kbd>WASD</kbd> / <kbd>Arrows</kbd> move &nbsp; <kbd>Space</kbd> hold to kick &nbsp; <kbd>Shift</kbd> / <kbd>B</kbd> boost<br>
-          Mouse: left kicks, right boosts &nbsp;·&nbsp; <kbd>C</kbd> camera &nbsp; <kbd>P</kbd> pause &nbsp; <kbd>Esc</kbd> menu<br>
+          Mouse: left kicks, right boosts &nbsp;·&nbsp; <kbd>C</kbd> camera &nbsp; <kbd>-</kbd> <kbd>=</kbd> or wheel: zoom &nbsp; <kbd>P</kbd> pause &nbsp; <kbd>Esc</kbd> menu<br>
           Kick while moving across the ball to curve it. Three boosts, 5s recharge each.<br>
           Touch: drag left side to move; right side lower half kicks, upper half boosts
         </div>
@@ -145,6 +145,7 @@ addEventListener('keydown', e => {
   keys[e.code] = true;
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
   if (e.code === 'KeyP' && (phase === 'play' || phase === 'countdown')) { paused = !paused; showBanner(paused ? 'Paused' : '', paused); }
+  if (e.code === 'Minus') zoom(1.12); if (e.code === 'Equal') zoom(1 / 1.12);
   if (e.code === 'KeyC') cam.mode = cam.mode === 'follow' ? 'full' : 'follow';
   if (e.code === 'Escape' && phase !== 'menu') openMenu('Kickabout', 'Top-down arcade soccer against CPU players.');
 });
@@ -387,7 +388,9 @@ function endMatch() {
 // ---------- rendering ----------
 const cv = document.getElementById('c'), ctx = cv.getContext('2d'), stage = document.getElementById('stage');
 // camera: 'follow' zooms in and pans with the action; 'full' shows the whole pitch (toggle with C)
-const VIEW_W = 1180;                          // world units visible across the screen when following
+let viewW = 1450;                             // world units visible across the screen when following (mouse wheel or - / = to change)
+try { viewW = clamp(+localStorage.getItem('kickabout.viewW') || 1450, 900, 2600); } catch {}
+function zoom(f) { viewW = clamp(viewW * f, 900, 2600); try { localStorage.setItem('kickabout.viewW', viewW); } catch {} }
 const cam = { x: 0, y: 0, mode: 'follow', set: false };
 let cw = 1, ch = 1, dpr = 1;
 function resize() {
@@ -399,7 +402,7 @@ function resize() {
 addEventListener('resize', resize);
 function view() {
   const fit = Math.min(cw / W, ch / H);
-  const s = cam.mode === 'follow' ? Math.max(fit, cw / VIEW_W) : fit;
+  const s = cam.mode === 'follow' ? Math.max(fit, Math.min(cw / viewW, ch / (viewW * 0.5))) : fit;
   const vw = cw / s, vh = ch / s;
   // look at a point between your player and the ball (just the ball when watching)
   let tx = CX, ty = CY;
@@ -475,6 +478,7 @@ document.querySelectorAll('.seg').forEach(seg => seg.addEventListener('click', e
   seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
   const k = seg.dataset.opt; opts[k] = k === 'mode' ? b.dataset.v : +b.dataset.v;
 }));
+cv.addEventListener('wheel', e => { e.preventDefault(); zoom(e.deltaY > 0 ? 1.08 : 1 / 1.08); }, { passive: false });
 $('camBtn').addEventListener('click', e => { cam.mode = cam.mode === 'follow' ? 'full' : 'follow'; e.currentTarget.blur(); });
 $('start').addEventListener('click', () => { $('menu').classList.add('hidden'); newMatch(); });
 
