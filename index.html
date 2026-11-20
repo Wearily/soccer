@@ -50,15 +50,17 @@
         <h1 id="mTitle">Kickabout</h1>
         <p id="mSub">Top-down arcade soccer against CPU players.</p>
         <div class="row"><label>Team size</label><div class="seg" data-opt="size">
-          <button data-v="1">1v1</button><button data-v="2">2v2</button><button data-v="3" class="on">3v3</button><button data-v="4">4v4</button></div></div>
+          <button data-v="1">1v1</button><button data-v="2">2v2</button><button data-v="3" class="on">3v3</button><button data-v="4">4v4</button><button data-v="5">5v5</button></div></div>
         <div class="row"><label>CPU difficulty</label><div class="seg" data-opt="diff">
           <button data-v="0">Easy</button><button data-v="1" class="on">Normal</button><button data-v="2">Hard</button></div></div>
         <div class="row"><label>You</label><div class="seg" data-opt="mode">
           <button data-v="play" class="on">Play (red)</button><button data-v="watch">Watch CPU vs CPU</button></div></div>
         <button class="go" id="start">Kick off</button>
         <div class="keys">
-          <kbd>WASD</kbd> / <kbd>Arrows</kbd> move &nbsp; <kbd>Space</kbd> / <kbd>X</kbd> kick &nbsp; <kbd>Shift</kbd> sprint<br>
-          <kbd>P</kbd> pause &nbsp; <kbd>Esc</kbd> menu &nbsp;·&nbsp; Touch: drag left side to move, tap right side to kick
+          <kbd>WASD</kbd> / <kbd>Arrows</kbd> move &nbsp; <kbd>Space</kbd> hold to kick &nbsp; <kbd>Shift</kbd> / <kbd>B</kbd> boost<br>
+          Mouse: left kicks, right boosts &nbsp;·&nbsp; <kbd>P</kbd> pause &nbsp; <kbd>Esc</kbd> menu<br>
+          Kick while moving across the ball to curve it. Three boosts, 5s recharge each.<br>
+          Touch: drag left side to move; right side lower half kicks, upper half boosts
         </div>
       </div>
     </div>
@@ -76,6 +78,9 @@ const PR = 16, BR = 9;                        // player / ball radius
 const ACC = 0.115, P_DAMP = 0.962, B_DAMP = 0.988;
 const KICK = 6.6, KICK_REACH = 5;
 const MATCH_SECS = 180;
+const CR = 70;                                // rounded pitch corner radius
+const BOOSTS = 3, BOOST_RECHARGE = 300, BOOST_REPEAT = 26, BOOST_IMP = 3.1;
+const CURVE = 0.022, SPIN_DECAY = 0.985;
 const DIFF = [ { speed: 0.80, noise: 0.30 }, { speed: 0.92, noise: 0.14 }, { speed: 1.0, noise: 0.04 } ];
 const POSTS = [ [L, CY - GOAL_W / 2], [L, CY + GOAL_W / 2], [R, CY - GOAL_W / 2], [R, CY + GOAL_W / 2] ];
 
@@ -90,7 +95,8 @@ const hyp = Math.hypot;
 function formation(n, i) {
   // returns [depth 0..1 from own goal toward centre, y offset -1..1]
   const F = { 1: [[0.6, 0]], 2: [[0.25, 0], [0.7, 0]], 3: [[0.2, 0], [0.65, -0.45], [0.65, 0.45]],
-              4: [[0.15, 0], [0.45, 0], [0.75, -0.5], [0.75, 0.5]] };
+              4: [[0.15, 0], [0.45, 0], [0.75, -0.5], [0.75, 0.5]],
+              5: [[0.12, 0], [0.4, -0.4], [0.4, 0.4], [0.78, -0.5], [0.78, 0.5]] };
   return F[n][i];
 }
 function resetPositions() {
@@ -99,15 +105,15 @@ function resetPositions() {
     const dir = p.team === 0 ? 1 : -1;
     p.x = (dir > 0 ? L : R) + dir * d * (PW / 2 - 40);
     p.y = CY + oy * PH / 2;
-    p.vx = p.vy = 0; p.cool = 0; p.kickFx = 0; p.kickHeld = false;
+    p.vx = p.vy = 0; p.cool = 0; p.kickFx = 0; p.boosts = BOOSTS; p.boostT = 0; p.boostCd = 0; p.boostFx = 0;
   }
-  ball = { x: CX, y: CY, vx: 0, vy: 0 };
+  ball = { x: CX, y: CY, vx: 0, vy: 0, spin: 0 };
 }
 function newMatch() {
   players = []; human = null;
   for (let t = 0; t < 2; t++) for (let i = 0; i < opts.size; i++)
-    players.push({ team: t, idx: i, x: 0, y: 0, vx: 0, vy: 0, cool: 0, kickFx: 0, kickHeld: false, human: false,
-                   stamina: 1, seed: Math.random() * 100, wantKick: false, ix: 0, iy: 0 });
+    players.push({ team: t, idx: i, x: 0, y: 0, vx: 0, vy: 0, cool: 0, kickFx: 0, human: false,
+                   boosts: BOOSTS, boostT: 0, boostCd: 0, boostFx: 0, seed: Math.random() * 100, wantKick: false, ix: 0, iy: 0 });
   if (opts.mode === 'play') { human = players[opts.size - 1]; human.human = true; } // red striker
   score = [0, 0]; timeLeft = MATCH_SECS * 60; overtime = false;
   resetPositions(); setPhase('countdown', 90); paused = false; updateHud();
@@ -116,7 +122,8 @@ function setPhase(p, t) { phase = p; phaseT = t || 0; }
 
 // ---------- input ----------
 const keys = {};
-const touch = { id: null, ox: 0, oy: 0, dx: 0, dy: 0, kick: false };
+const touch = { id: null, ox: 0, oy: 0, dx: 0, dy: 0, kick: 0, boost: 0 };
+const mouse = { kick: false, boost: false };
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
@@ -131,8 +138,8 @@ function humanInput(p) {
   let iy = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0);
   if (touch.id !== null) { const m = hyp(touch.dx, touch.dy); if (m > 8) { ix = touch.dx / Math.max(m, 40); iy = touch.dy / Math.max(m, 40); } }
   p.ix = ix; p.iy = iy;
-  p.wantKick = !!(keys.Space || keys.KeyX || touch.kick);
-  p.sprint = !!(keys.ShiftLeft || keys.ShiftRight);
+  p.wantKick = !!(keys.Space || keys.KeyX || touch.kick || mouse.kick);
+  p.sprint = !!(keys.ShiftLeft || keys.ShiftRight || keys.KeyB || touch.boost || mouse.boost);
 }
 
 // ---------- CPU brain ----------
@@ -194,7 +201,7 @@ function think(p, tick) {
     const near = d < PR + BR + KICK_REACH;
     const inOwnThird = dir * (ball.x - ownGX) < PW * 0.3;
     if (near && (align > 0.93 - cfg.noise * 0.5 || (inOwnThird && rx * dir > 0.35))) kick = true;
-    sprint = d > 120;
+    sprint = d > 150 && align > 0.2 || (near && kick);
   } else {
     // off-ball roles: lowest-numbered non-chaser guards the goal, the rest offer support
     const mates = players.filter(q => q.team === p.team && !q.chasing && !q.human);
@@ -215,7 +222,7 @@ function think(p, tick) {
   }
   const mx = tx - p.x, my = ty - p.y, ml = hyp(mx, my);
   const sc = ml < 4 ? 0 : Math.min(1, ml / 26) * cfg.speed / ml;
-  p.ix = mx * sc; p.iy = my * sc; p.wantKick = kick; p.sprint = sprint && cfg.speed > 0.85;
+  p.ix = mx * sc; p.iy = my * sc; p.wantKick = kick; p.sprint = sprint && cfg.speed > 0.85 && (p.boosts > 1 || d < 200);
 }
 
 // ---------- physics ----------
@@ -245,6 +252,18 @@ function ballWalls() {
   const b = ball, e = 0.6, top = CY - GOAL_W / 2, bot = CY + GOAL_W / 2;
   if (b.y < T + BR) { b.y = T + BR; b.vy = Math.abs(b.vy) * e; }
   if (b.y > B - BR) { b.y = B - BR; b.vy = -Math.abs(b.vy) * e; }
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) {            // rounded corners
+    const cx = sx < 0 ? L + CR : R - CR, cy = sy < 0 ? T + CR : B - CR;
+    const dx = b.x - cx, dy = b.y - cy;
+    if (dx * sx > 0 && dy * sy > 0) {
+      const dist = hyp(dx, dy), max = CR - BR;
+      if (dist > max) {
+        const nx = dx / dist, ny = dy / dist, vn = b.vx * nx + b.vy * ny;
+        b.x = cx + nx * max; b.y = cy + ny * max;
+        if (vn > 0) { b.vx -= (1 + e) * vn * nx; b.vy -= (1 + e) * vn * ny; b.spin *= 0.5; }
+      }
+    }
+  }
   for (const s of [-1, 1]) {
     const line = s < 0 ? L : R, over = s * (b.x - line);       // >0 means past the goal line
     if (over > -BR) {
@@ -267,12 +286,19 @@ function step(tick) {
   for (const p of players) {
     if (p.human) humanInput(p); else think(p, tick);
     let ix = p.ix, iy = p.iy; const m = hyp(ix, iy); if (m > 1) { ix /= m; iy /= m; }
-    let acc = ACC;
-    if (p.sprint && p.stamina > 0.05 && m > 0.1) { acc *= 1.3; p.stamina = Math.max(0, p.stamina - 0.006); }
-    else p.stamina = Math.min(1, p.stamina + 0.003);
-    p.vx = (p.vx + ix * acc) * P_DAMP; p.vy = (p.vy + iy * acc) * P_DAMP;
+    if (p.boostCd > 0) p.boostCd--; if (p.boostFx > 0) p.boostFx--;
+    if (p.boosts < BOOSTS && ++p.boostT >= BOOST_RECHARGE) { p.boosts++; p.boostT = 0; }
+    if (p.sprint && p.boosts > 0 && p.boostCd === 0 && m > 0.1) {     // burst in the input direction
+      p.vx += ix / m * BOOST_IMP; p.vy += iy / m * BOOST_IMP;
+      p.boosts--; p.boostCd = BOOST_REPEAT; p.boostFx = 14;
+    }
+    p.vx = (p.vx + ix * ACC) * P_DAMP; p.vy = (p.vy + iy * ACC) * P_DAMP;
     p.x += p.vx; p.y += p.vy;
     if (p.cool > 0) p.cool--; if (p.kickFx > 0) p.kickFx--;
+  }
+  { // spin bends the path sideways (curve shots)
+    const c = ball.spin * CURVE, vx = ball.vx, vy = ball.vy;
+    ball.vx += -vy * c; ball.vy += vx * c; ball.spin *= SPIN_DECAY;
   }
   ball.vx *= B_DAMP; ball.vy *= B_DAMP; ball.x += ball.vx; ball.y += ball.vy;
 
@@ -283,15 +309,15 @@ function step(tick) {
     hitPost(p, PR, 0.2);
     p.x = clamp(p.x, PR + 4, W - PR - 4); p.y = clamp(p.y, PR + 4, H - PR - 4);
   }
-  // kicks: one kick per press for the human, short cooldown for CPUs
+  // kicks: hold to kick; fires whenever the ball is in reach, with a short cooldown
   for (const p of players) {
-    const fresh = p.human ? (p.wantKick && !p.kickHeld) : p.wantKick;
-    if (p.human && !p.wantKick) p.kickHeld = false;
-    if (!fresh || p.cool > 0) continue;
+    if (!p.wantKick || p.cool > 0) continue;
     const dx = ball.x - p.x, dy = ball.y - p.y, dist = hyp(dx, dy);
     if (dist < PR + BR + KICK_REACH && dist > 0) {
       ball.vx += dx / dist * KICK; ball.vy += dy / dist * KICK;
-      p.cool = 14; p.kickFx = 10; p.kickHeld = true;
+      // sideways movement across the ball at the moment of the kick adds spin
+      ball.spin = clamp((dx / dist * p.vy - dy / dist * p.vx) * 0.55, -1.6, 1.6);
+      p.cool = 14; p.kickFx = 10;
     }
   }
   hitPost(ball, BR, 0.7); ballWalls();
@@ -330,9 +356,11 @@ addEventListener('resize', resize);
 function draw() {
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   ctx.fillStyle = '#245c2c'; ctx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.beginPath(); ctx.roundRect(L, T, PW, PH, CR); ctx.clip();
   for (let i = 0; i < 10; i++) { ctx.fillStyle = i % 2 ? '#2e7d32' : '#2a7230'; ctx.fillRect(L + i * PW / 10, T, PW / 10, PH); }
+  ctx.restore();
   ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 3;
-  ctx.strokeRect(L, T, PW, PH);
+  ctx.beginPath(); ctx.roundRect(L, T, PW, PH, CR); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(CX, T); ctx.lineTo(CX, B); ctx.stroke();
   ctx.beginPath(); ctx.arc(CX, CY, 70, 0, 7); ctx.stroke();
   ctx.strokeRect(L, CY - 130, 110, 260); ctx.strokeRect(R - 110, CY - 130, 110, 260);
@@ -346,13 +374,17 @@ function draw() {
   // players
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = 'bold 14px system-ui,sans-serif';
   for (const p of players) {
+    if (p.boostFx > 0) { ctx.strokeStyle = `rgba(255,255,255,${p.boostFx / 20})`; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 7, p.y - p.vy * 7); ctx.stroke(); }
     ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.ellipse(p.x + 2, p.y + 4, PR, PR * 0.85, 0, 0, 7); ctx.fill();
     ctx.fillStyle = p.team ? '#42a5f5' : '#ef5350'; ctx.beginPath(); ctx.arc(p.x, p.y, PR, 0, 7); ctx.fill();
     ctx.lineWidth = p.kickFx > 0 ? 4 : 2.5; ctx.strokeStyle = p.kickFx > 0 ? '#fff' : (p.human ? '#ffd54f' : 'rgba(0,0,0,.55)'); ctx.stroke();
     ctx.fillStyle = '#fff'; ctx.fillText(p.human ? 'YOU' : String(p.idx + 1), p.x, p.y + 1);
     if (p.human) {
-      ctx.fillStyle = 'rgba(0,0,0,.4)'; ctx.fillRect(p.x - 16, p.y - PR - 10, 32, 4);
-      ctx.fillStyle = '#ffd54f'; ctx.fillRect(p.x - 16, p.y - PR - 10, 32 * p.stamina, 4);
+      for (let i = 0; i < BOOSTS; i++) {                           // boost pips; the next one fills as it recharges
+        const f = i < p.boosts ? 1 : i === p.boosts ? p.boostT / BOOST_RECHARGE : 0;
+        ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(p.x - 17 + i * 12, p.y - PR - 10, 10, 4);
+        ctx.fillStyle = '#ffd54f'; ctx.fillRect(p.x - 17 + i * 12, p.y - PR - 10, 10 * f, 4);
+      }
     }
   }
   // ball
@@ -388,10 +420,14 @@ cv.addEventListener('pointerdown', e => {
   if (e.pointerType === 'mouse') return;
   const r = cv.getBoundingClientRect();
   if (e.clientX - r.left < r.width / 2 && touch.id === null) { touch.id = e.pointerId; touch.ox = e.clientX; touch.oy = e.clientY; touch.dx = touch.dy = 0; }
-  else { touch.kick = true; setTimeout(() => { touch.kick = false; }, 120); }
+  else if (e.clientY - r.top < r.height / 2) touch.boost = e.pointerId; else touch.kick = e.pointerId;
 });
 cv.addEventListener('pointermove', e => { if (e.pointerId === touch.id) { touch.dx = e.clientX - touch.ox; touch.dy = e.clientY - touch.oy; } });
-const endTouch = e => { if (e.pointerId === touch.id) { touch.id = null; touch.dx = touch.dy = 0; } };
+const endTouch = e => { if (e.pointerId === touch.id) { touch.id = null; touch.dx = touch.dy = 0; }
+  if (e.pointerId === touch.kick) touch.kick = 0; if (e.pointerId === touch.boost) touch.boost = 0; };
+cv.addEventListener('mousedown', e => { if (e.button === 0 || e.button === 1) mouse.kick = true; if (e.button === 2 || e.button === 1) mouse.boost = true; });
+addEventListener('mouseup', () => { mouse.kick = mouse.boost = false; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
 cv.addEventListener('pointerup', endTouch); cv.addEventListener('pointercancel', endTouch);
 
 // ---------- main loop ----------
