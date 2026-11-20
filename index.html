@@ -16,6 +16,7 @@
   #clock { color:var(--dim); font-size:18px; min-width:110px; text-align:center; }
   #stage { position:relative; flex:1; width:100%; min-height:0; }
   canvas { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); border-radius:10px; }
+  #camBtn { position:absolute; right:14px; top:10px; z-index:3; padding:6px 10px; border:1px solid #2d3948; background:rgba(20,27,36,.8); color:var(--ink); border-radius:8px; font:inherit; font-size:12px; cursor:pointer; }
   .overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(10,14,20,.72); z-index:5; }
   .overlay.hidden { display:none; }
   .card { background:var(--panel); border-radius:14px; padding:24px 28px; width:min(92vw,420px); box-shadow:0 12px 40px rgba(0,0,0,.5); }
@@ -44,6 +45,7 @@
   </div>
   <div id="stage">
     <canvas id="c"></canvas>
+    <button id="camBtn" type="button">Camera (C)</button>
     <div id="banner"></div>
     <div id="menu" class="overlay">
       <div class="card">
@@ -58,7 +60,7 @@
         <button class="go" id="start">Kick off</button>
         <div class="keys">
           <kbd>WASD</kbd> / <kbd>Arrows</kbd> move &nbsp; <kbd>Space</kbd> hold to kick &nbsp; <kbd>Shift</kbd> / <kbd>B</kbd> boost<br>
-          Mouse: left kicks, right boosts &nbsp;·&nbsp; <kbd>P</kbd> pause &nbsp; <kbd>Esc</kbd> menu<br>
+          Mouse: left kicks, right boosts &nbsp;·&nbsp; <kbd>C</kbd> camera &nbsp; <kbd>P</kbd> pause &nbsp; <kbd>Esc</kbd> menu<br>
           Kick while moving across the ball to curve it. Three boosts, 5s recharge each.<br>
           Touch: drag left side to move; right side lower half kicks, upper half boosts
         </div>
@@ -69,22 +71,33 @@
 <script>
 (() => {
 'use strict';
-// ---------- constants (world units; fixed 60Hz simulation) ----------
-const PW = 1000, PH = 534, M = 50;            // pitch size and surrounding margin
-const W = PW + 2 * M, H = PH + 2 * M, CX = W / 2, CY = H / 2;
-const L = M, R = M + PW, T = M, B = M + PH;   // pitch lines
-const GOAL_W = 200, GOAL_D = 36, POST_R = 6;
-const PR = 22, BR = 10.5;                        // player / ball radius
-// movement: quick to top speed (~0.5s), stops in well under a second when you let go
-const ACC = 0.282, P_DAMP = 0.937, B_DAMP = 0.9846;
-const VMAX = ACC * P_DAMP / (1 - P_DAMP);    // ~4.2 units/tick: crosses the pitch in ~4s
-const KICK = 8.3, KICK_REACH = 6;             // kicked ball leaves at about twice running speed
+// ---------- constants (world units, seconds; physics runs at 120Hz) ----------
+const HZ = 120, DT = 1 / HZ;
+const M = 100, ROAM = 86;                     // margin around the pitch; players may step this far off it
+const GOAL_D = 48, POST_R = 7, CR = 60;       // net depth, post radius, rounded corner radius
+const PR = 23, BR = 12;                       // player / ball radius
+// pitch grows with team size: [width, height, goal width]
+const FIELDS = { 1: [1120, 620, 220], 2: [1300, 730, 240], 3: [1500, 840, 260], 4: [1680, 940, 290], 5: [1840, 1040, 290] };
+let PW, PH, GOAL_W, W, H, CX, CY, L, R, T, B, POSTS;
+function setField(size) {
+  [PW, PH, GOAL_W] = FIELDS[size];
+  W = PW + 2 * M; H = PH + 2 * M; CX = W / 2; CY = H / 2;
+  L = M; R = M + PW; T = M; B = M + PH;
+  POSTS = [ [L, CY - GOAL_W / 2], [L, CY + GOAL_W / 2], [R, CY - GOAL_W / 2], [R, CY + GOAL_W / 2] ];
+}
+// movement: top running speed is RUN_ACC / RUN_DRAG (~287 units/s); letting go coasts to a stop
+const RUN_ACC = 1250, RUN_DRAG = 4.35, COAST_DRAG = 3.7, P_MAX = 650;
+const BOOSTS = 3, BOOST_REGEN = 5, BOOST_CD = 0.2, BOOST_IMP = 300, BOOST_TIME = 0.15, BOOST_DRAG = 4;
+// ball and kicking: a kick sets the ball's speed, plus a share of the kicker's own velocity
+const BALL_DRAG = 0.95, BALL_STOP = 10, BALL_MAX = 880, BALL_WALL = 0.62;
+const KICK_GAP = 12, KICK_SPEED = 620, KICK_CARRY = 0.35, KICK_CD = 1 / 6, KICK_RECOIL = 40;
+// collisions: players are heavy, the ball is light and barely bounces off a touch (so you can dribble)
+const P_INV = 0.35, B_INV = 2.8, TOUCH_BOUNCE = 0.06, BOOST_TOUCH_BOUNCE = 0.16, P_BOUNCE = 0.06, P_WALL = 0.08;
+// spin: kicking across the ball spins it, spin bends its path, and surfaces grip a spinning ball
+const SPIN_INERTIA = 2 / 3, SPIN_MAX = 28, SPIN_DRAG = 0.85, CURVE = 0.0315;
+const GRIP_TOUCH = 0.22, GRIP_WALL = 0.28, KICK_SPIN = 0.65, KICK_SPIN_KEEP = 0.35;
 const MATCH_SECS = 180;
-const CR = 48;                                // rounded pitch corner radius
-const BOOSTS = 3, BOOST_RECHARGE = 300, BOOST_REPEAT = 14, BOOST_IMP = 3.75;
-const CURVE = 0.022, SPIN_DECAY = 0.985;
 const DIFF = [ { speed: 0.80, noise: 0.30 }, { speed: 0.92, noise: 0.14 }, { speed: 1.0, noise: 0.04 } ];
-const POSTS = [ [L, CY - GOAL_W / 2], [L, CY + GOAL_W / 2], [R, CY - GOAL_W / 2], [R, CY + GOAL_W / 2] ];
 
 const opts = { size: 3, diff: 1, mode: 'play' };
 let players = [], ball, score, timeLeft, overtime, phase, phaseT, paused = false, human = null;
@@ -107,15 +120,17 @@ function resetPositions() {
     const dir = p.team === 0 ? 1 : -1;
     p.x = (dir > 0 ? L : R) + dir * d * (PW / 2 - 40);
     p.y = CY + oy * PH / 2;
-    p.vx = p.vy = 0; p.cool = 0; p.kickFx = 0; p.boosts = BOOSTS; p.boostT = 0; p.boostCd = 0; p.boostFx = 0;
+    p.vx = p.vy = 0; p.cool = 0; p.kickFx = 0; p.boosts = BOOSTS; p.boostT = 0; p.boostCd = 0; p.boostFx = 0; p.burst = 0;
+    p.ax = dir; p.ay = 0;
   }
   ball = { x: CX, y: CY, vx: 0, vy: 0, spin: 0 };
 }
 function newMatch() {
   players = []; human = null;
+  setField(opts.size); resize(); cam.set = false;
   for (let t = 0; t < 2; t++) for (let i = 0; i < opts.size; i++)
     players.push({ team: t, idx: i, x: 0, y: 0, vx: 0, vy: 0, cool: 0, kickFx: 0, human: false,
-                   boosts: BOOSTS, boostT: 0, boostCd: 0, boostFx: 0, seed: Math.random() * 100, wantKick: false, ix: 0, iy: 0 });
+                   boosts: BOOSTS, boostT: 0, boostCd: 0, boostFx: 0, burst: 0, ax: 1, ay: 0, seed: Math.random() * 100, wantKick: false, ix: 0, iy: 0 });
   if (opts.mode === 'play') { human = players[opts.size - 1]; human.human = true; } // red striker
   score = [0, 0]; timeLeft = MATCH_SECS * 60; overtime = false;
   resetPositions(); setPhase('countdown', 90); paused = false; updateHud();
@@ -130,6 +145,7 @@ addEventListener('keydown', e => {
   keys[e.code] = true;
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
   if (e.code === 'KeyP' && (phase === 'play' || phase === 'countdown')) { paused = !paused; showBanner(paused ? 'Paused' : '', paused); }
+  if (e.code === 'KeyC') cam.mode = cam.mode === 'follow' ? 'full' : 'follow';
   if (e.code === 'Escape' && phase !== 'menu') openMenu('Kickabout', 'Top-down arcade soccer against CPU players.');
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
@@ -150,7 +166,7 @@ function pickChasers() {
   for (let t = 0; t < 2; t++) {
     let best = Infinity;
     for (const p of players) if (p.team === t) {
-      let d = hyp(ball.x + ball.vx * 8 - p.x, ball.y + ball.vy * 8 - p.y);
+      let d = hyp(ball.x + ball.vx * 0.13 - p.x, ball.y + ball.vy * 0.13 - p.y);
       if (p.chasing) d *= 0.8;                 // hysteresis so roles don't flicker
       if (d < best) { best = d; out[t] = p; }
     }
@@ -170,7 +186,8 @@ function think(p, tick) {
   const cfg = DIFF[p.team === 0 && human ? 1 : opts.diff];
   const oppGX = dir > 0 ? R : L, ownGX = dir > 0 ? L : R;
   const d = hyp(ball.x - p.x, ball.y - p.y);
-  const lead = Math.min(d / 6, 18);
+  const k = PW / 1000;                                         // AI distances scale with the pitch
+  const lead = Math.min(d / 600, 0.3);                         // seconds of ball travel to anticipate
   const bx = clamp(ball.x + ball.vx * lead, L + BR, R - BR), by = clamp(ball.y + ball.vy * lead, T + BR, B - BR);
   const wob = Math.sin(tick * 0.05 + p.seed) * cfg.noise;     // slow aim wobble = imperfection
   let tx, ty, kick = false, sprint = false;
@@ -181,8 +198,8 @@ function think(p, tick) {
     let keeperY = CY, kd = Infinity;
     for (const q of players) if (q.team !== p.team) { const k = Math.abs(q.x - oppGX); if (k < kd) { kd = k; keeperY = q.y; } }
     ay = CY + (keeperY > CY ? -1 : 1) * GOAL_W * 0.28;
-    if (Math.abs(oppGX - bx) > 380) {
-      let bestF = 70;
+    if (Math.abs(oppGX - bx) > 380 * k) {
+      let bestF = 70 * k;
       for (const m of players) if (m.team === p.team && m !== p) {
         const f = dir * (m.x - bx);
         if (f > bestF && laneOpen(bx, by, m.x, m.y, p.team)) { bestF = f; ax = m.x + dir * 40; ay = m.y; }
@@ -200,83 +217,138 @@ function think(p, tick) {
     } else if (align < 0.93) {
       tx = bx - ux * (PR + BR + 2); ty = by - uy * (PR + BR + 2);
     } else { tx = bx + ux * 12; ty = by + uy * 12; }           // lined up: drive through it
-    const near = d < PR + BR + KICK_REACH;
+    const near = d < PR + BR + KICK_GAP;
     const inOwnThird = dir * (ball.x - ownGX) < PW * 0.3;
     if (near && (align > 0.93 - cfg.noise * 0.5 || (inOwnThird && rx * dir > 0.35))) kick = true;
-    sprint = d > 150 && align > 0.2 || (near && kick);
+    sprint = d > 150 * k && align > 0.2;
   } else {
     // off-ball roles: lowest-numbered non-chaser guards the goal, the rest offer support
     const mates = players.filter(q => q.team === p.team && !q.chasing && !q.human);
     const rank = mates.indexOf(p);
     if (rank === 0 && opts.size > 1) {
       const danger = dir * (bx - ownGX) < PW * 0.45;
-      tx = ownGX + dir * (danger ? 40 : 110);
+      tx = ownGX + dir * (danger ? 45 : 110 * k);
       ty = CY + clamp((by - CY) * 0.6, -GOAL_W / 2, GOAL_W / 2);
     } else {
       const side = (rank % 2 ? 1 : -1) * (by < CY ? -1 : 1) * -1;
-      tx = bx + dir * (rank % 2 ? 150 : -90);
+      tx = bx + dir * (rank % 2 ? 150 : -90) * k;
       ty = CY + side * PH * 0.27;
-      if (Math.abs(ty - by) < 90) ty = by + (by < CY ? 1 : -1) * 140;
+      if (Math.abs(ty - by) < 90 * k) ty = by + (by < CY ? 1 : -1) * 140 * k;
     }
     tx = clamp(tx, L + 30, R - 30); ty = clamp(ty, T + 30, B - 30);
     // opportunistic clearance if the ball rolls into us and we'd hit it upfield
-    if (d < PR + BR + KICK_REACH && (ball.x - p.x) * dir > 0.3 * d) kick = true;
+    if (d < PR + BR + KICK_GAP && (ball.x - p.x) * dir > 0.3 * d) kick = true;
   }
   const mx = tx - p.x, my = ty - p.y, ml = hyp(mx, my);
   const sc = ml < 4 ? 0 : Math.min(1, ml / 26) * cfg.speed / ml;
-  p.ix = mx * sc; p.iy = my * sc; p.wantKick = kick; p.sprint = sprint && cfg.speed > 0.85 && (p.boosts > 1 || d < 200);
+  p.ix = mx * sc; p.iy = my * sc; p.wantKick = kick; p.sprint = sprint && cfg.speed > 0.85 && (p.boosts > 1 || d < 260);
 }
 
 // ---------- physics ----------
-function collide(a, b, ra, rb, ima, imb, rest) {
+const limit = (o, max) => { const v = hyp(o.vx, o.vy); if (v > max) { o.vx *= max / v; o.vy *= max / v; } };
+// A surface rubbing against the ball: trades sideways slip for spin (and back), capped by grip * hit strength.
+// (nx, ny) is the contact normal pointing at the ball; `other` is the thing touching it (null = a wall).
+function rub(other, nx, ny, oInv, hit, grip) {
+  const tx = -ny, ty = nx, spinInv = B_INV / (SPIN_INERTIA * BR * BR);
+  const slip = (ball.vx - (other ? other.vx : 0)) * tx + (ball.vy - (other ? other.vy : 0)) * ty - ball.spin * BR;
+  const j = clamp(-slip / (oInv + B_INV + BR * BR * spinInv), -grip * hit, grip * hit);
+  ball.vx += tx * j * B_INV; ball.vy += ty * j * B_INV; ball.spin -= BR * j * spinInv;
+  if (other) { other.vx -= tx * j * oInv; other.vy -= ty * j * oInv; }
+}
+function collide(a, b, ra, rb, aInv, bInv, bounce) {
   const dx = b.x - a.x, dy = b.y - a.y, dist = hyp(dx, dy), min = ra + rb;
   if (dist >= min || dist === 0) return;
-  const nx = dx / dist, ny = dy / dist, pen = min - dist, tot = ima + imb;
-  a.x -= nx * pen * ima / tot; a.y -= ny * pen * ima / tot;
-  b.x += nx * pen * imb / tot; b.y += ny * pen * imb / tot;
+  const nx = dx / dist, ny = dy / dist, pen = min - dist, tot = aInv + bInv;
+  a.x -= nx * pen * aInv / tot; a.y -= ny * pen * aInv / tot;
+  b.x += nx * pen * bInv / tot; b.y += ny * pen * bInv / tot;
   const rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
-  if (rv > 0) return;
-  const j = -(1 + rest) * rv / tot;
-  a.vx -= j * ima * nx; a.vy -= j * ima * ny; b.vx += j * imb * nx; b.vy += j * imb * ny;
+  if (rv >= 0) return;
+  const j = -(1 + bounce) * rv / tot;
+  a.vx -= j * aInv * nx; a.vy -= j * aInv * ny; b.vx += j * bInv * nx; b.vy += j * bInv * ny;
+  if (b === ball) rub(aInv ? a : null, nx, ny, aInv, j, aInv ? GRIP_TOUCH : GRIP_WALL);
 }
-function hitPost(o, r, rest) {
-  for (const [px, py] of POSTS) {
-    const dx = o.x - px, dy = o.y - py, dist = hyp(dx, dy), min = r + POST_R;
-    if (dist < min && dist > 0) {
-      const nx = dx / dist, ny = dy / dist;
-      o.x = px + nx * min; o.y = py + ny * min;
-      const vn = o.vx * nx + o.vy * ny;
-      if (vn < 0) { o.vx -= (1 + rest) * vn * nx; o.vy -= (1 + rest) * vn * ny; }
+// push `o` back along outward normal (nx, ny) and bounce it
+function bounceOff(o, nx, ny, bounce) {
+  const vn = o.vx * nx + o.vy * ny;
+  if (vn <= 0) return;
+  o.vx -= (1 + bounce) * vn * nx; o.vy -= (1 + bounce) * vn * ny;
+  if (o === ball) rub(null, -nx, -ny, 0, (1 + bounce) * vn / B_INV, GRIP_WALL);
+}
+// keep a circle inside a rounded rectangle centred on the pitch; the ball may pass through the goal mouths
+function walls(o, r, extra, bounce) {
+  const isBall = o === ball, hw = PW / 2 + extra, hh = PH / 2 + extra;
+  let x = o.x - CX, y = o.y - CY;
+  if (isBall && Math.abs(x) > PW / 2 && Math.abs(y) < GOAL_W / 2) {          // inside a net
+    const s = Math.sign(x);
+    if (Math.abs(y) > GOAL_W / 2 - r) { const sy = Math.sign(y); y = sy * (GOAL_W / 2 - r); bounceOff(o, 0, sy, 0.2); }
+    if (Math.abs(x) > PW / 2 + GOAL_D - r) { x = s * (PW / 2 + GOAL_D - r); bounceOff(o, s, 0, 0.1); }
+    o.x = CX + x; o.y = CY + y; return;
+  }
+  if (Math.abs(y) > hh - r) { const s = Math.sign(y); y = s * (hh - r); bounceOff(o, 0, s, bounce); }
+  if (!(isBall && Math.abs(y) < GOAL_W / 2) && Math.abs(x) > hw - r) { const s = Math.sign(x); x = s * (hw - r); bounceOff(o, s, 0, bounce); }
+  const cx = hw - CR, cy = hh - CR;
+  if (Math.abs(x) > cx && Math.abs(y) > cy) {                               // rounded corner
+    const dx = Math.abs(x) - cx, dy = Math.abs(y) - cy, dist = hyp(dx, dy), max = CR - r;
+    if (dist > max) {
+      const nx = dx / dist * Math.sign(x), ny = dy / dist * Math.sign(y);
+      x = Math.sign(x) * cx + nx * max; y = Math.sign(y) * cy + ny * max; bounceOff(o, nx, ny, bounce);
     }
   }
+  o.x = CX + x; o.y = CY + y;
 }
-function ballWalls() {
-  const b = ball, e = 0.6, top = CY - GOAL_W / 2, bot = CY + GOAL_W / 2;
-  if (b.y < T + BR) { b.y = T + BR; b.vy = Math.abs(b.vy) * e; }
-  if (b.y > B - BR) { b.y = B - BR; b.vy = -Math.abs(b.vy) * e; }
-  for (const sx of [-1, 1]) for (const sy of [-1, 1]) {            // rounded corners
-    const cx = sx < 0 ? L + CR : R - CR, cy = sy < 0 ? T + CR : B - CR;
-    const dx = b.x - cx, dy = b.y - cy;
-    if (dx * sx > 0 && dy * sy > 0) {
-      const dist = hyp(dx, dy), max = CR - BR;
-      if (dist > max) {
-        const nx = dx / dist, ny = dy / dist, vn = b.vx * nx + b.vy * ny;
-        b.x = cx + nx * max; b.y = cy + ny * max;
-        if (vn > 0) { b.vx -= (1 + e) * vn * nx; b.vy -= (1 + e) * vn * ny; b.spin *= 0.5; }
-      }
+const post = { x: 0, y: 0, vx: 0, vy: 0 };
+function physics() {
+  for (const p of players) {
+    let ix = p.ix, iy = p.iy; const m = hyp(ix, iy); if (m > 1) { ix /= m; iy /= m; }
+    if (m > 0.05) { p.ax = ix / Math.min(m, 1); p.ay = iy / Math.min(m, 1); }   // remember facing for boosts
+    p.boostCd = Math.max(0, p.boostCd - DT); p.cool = Math.max(0, p.cool - DT); p.burst = Math.max(0, p.burst - DT);
+    if (p.boosts < BOOSTS && (p.boostT += DT) >= BOOST_REGEN) { p.boosts++; p.boostT = 0; }
+    if (p.sprint && p.boosts > 0 && p.boostCd === 0) {                        // burst along the facing direction
+      if (p.boosts === BOOSTS) p.boostT = 0;
+      p.boosts--; p.boostCd = BOOST_CD; p.burst = BOOST_TIME; p.boostFx = 14;
+      p.vx += p.ax * BOOST_IMP; p.vy += p.ay * BOOST_IMP;
     }
+    const drag = Math.exp(-(p.burst > 0 ? BOOST_DRAG : m > 0.05 ? RUN_DRAG : COAST_DRAG) * DT);
+    p.vx = (p.vx + ix * RUN_ACC * DT) * drag; p.vy = (p.vy + iy * RUN_ACC * DT) * drag;
+    limit(p, P_MAX);
   }
-  for (const s of [-1, 1]) {
-    const line = s < 0 ? L : R, over = s * (b.x - line);       // >0 means past the goal line
-    if (over > -BR) {
-      if (b.y > top && b.y < bot) {                            // inside the goal mouth / net
-        if (over > 0) {
-          if (b.y < top + BR) { b.y = top + BR; b.vy = Math.abs(b.vy) * 0.3; }
-          if (b.y > bot - BR) { b.y = bot - BR; b.vy = -Math.abs(b.vy) * 0.3; }
-        }
-        if (over > GOAL_D - BR) { b.x = line + s * (GOAL_D - BR); b.vx *= -0.2; }
-      } else { b.x = line - s * BR; b.vx = -s * Math.abs(b.vx) * e; }
+  // kicks: hold to kick; each attempt (hit or miss) starts a short cooldown
+  let n = 0, kx = 0, ky = 0, ks = 0;
+  for (const p of players) {
+    if (!p.wantKick || p.cool > 0) continue;
+    p.cool = KICK_CD;
+    const dx = ball.x - p.x, dy = ball.y - p.y, dist = hyp(dx, dy);
+    if (dist > PR + BR + KICK_GAP) continue;
+    const ux = dist > 0.001 ? dx / dist : p.ax, uy = dist > 0.001 ? dy / dist : p.ay;
+    // moving across the ball as you strike it puts spin on it; some existing spin carries over
+    const across = (p.vx - ball.vx) * -uy + (p.vy - ball.vy) * ux;
+    ks += clamp(ball.spin * KICK_SPIN_KEEP - across * KICK_SPIN / (SPIN_INERTIA * BR), -SPIN_MAX, SPIN_MAX);
+    kx += ux * KICK_SPEED + p.vx * KICK_CARRY; ky += uy * KICK_SPEED + p.vy * KICK_CARRY; n++;
+    p.vx -= ux * KICK_RECOIL; p.vy -= uy * KICK_RECOIL; p.kickFx = 10;
+  }
+  if (n) { ball.vx = kx / n; ball.vy = ky / n; ball.spin = ks / n; }
+  // spin decays and steadily turns the ball's direction of travel: that is the curve
+  ball.spin = clamp(ball.spin, -SPIN_MAX, SPIN_MAX) * Math.exp(-SPIN_DRAG * DT);
+  if (Math.abs(ball.spin) < 0.025) ball.spin = 0;
+  const a = ball.spin * CURVE * DT, ca = Math.cos(a), sa = Math.sin(a), bvx = ball.vx;
+  ball.vx = bvx * ca - ball.vy * sa; ball.vy = bvx * sa + ball.vy * ca;
+  const bd = Math.exp(-BALL_DRAG * DT); ball.vx *= bd; ball.vy *= bd;
+  limit(ball, BALL_MAX);
+  if (hyp(ball.vx, ball.vy) < BALL_STOP) ball.vx = ball.vy = 0;
+
+  for (let sub = 0; sub < 2; sub++) {
+    const h = DT / 2;
+    for (const p of players) { p.x += p.vx * h; p.y += p.vy * h; }
+    ball.x += ball.vx * h; ball.y += ball.vy * h;
+    for (let i = 0; i < players.length; i++) for (let j = i + 1; j < players.length; j++)
+      collide(players[i], players[j], PR, PR, 1, 1, P_BOUNCE);
+    for (const p of players) {
+      walls(p, PR, ROAM, P_WALL);
+      collide(p, ball, PR, BR, P_INV, B_INV, p.burst > 0 ? BOOST_TOUCH_BOUNCE : TOUCH_BOUNCE);
     }
+    walls(ball, BR, 0, BALL_WALL);
+    for (const [px, py] of POSTS) { post.x = px; post.y = py; collide(post, ball, POST_R, BR, 0, 1, BALL_WALL); }
+    limit(ball, BALL_MAX);
   }
 }
 function step(tick) {
@@ -287,44 +359,9 @@ function step(tick) {
   pickChasers();
   for (const p of players) {
     if (p.human) humanInput(p); else think(p, tick);
-    let ix = p.ix, iy = p.iy; const m = hyp(ix, iy); if (m > 1) { ix /= m; iy /= m; }
-    if (p.boostCd > 0) p.boostCd--; if (p.boostFx > 0) p.boostFx--;
-    if (p.boosts < BOOSTS && ++p.boostT >= BOOST_RECHARGE) { p.boosts++; p.boostT = 0; }
-    if (p.sprint && p.boosts > 0 && p.boostCd === 0 && m > 0.1) {     // burst in the input direction
-      p.vx += ix / m * BOOST_IMP; p.vy += iy / m * BOOST_IMP;
-      p.boosts--; p.boostCd = BOOST_REPEAT; p.boostFx = 14;
-    }
-    p.vx = (p.vx + ix * ACC) * P_DAMP; p.vy = (p.vy + iy * ACC) * P_DAMP;
-    const sp = hyp(p.vx, p.vy);                                      // boost speed bleeds off fast
-    if (sp > VMAX) { const k = (VMAX + (sp - VMAX) * 0.9) / sp; p.vx *= k; p.vy *= k; }
-    p.x += p.vx; p.y += p.vy;
-    if (p.cool > 0) p.cool--; if (p.kickFx > 0) p.kickFx--;
+    if (p.boostFx > 0) p.boostFx--; if (p.kickFx > 0) p.kickFx--;
   }
-  { // spin bends the path sideways (curve shots)
-    const c = ball.spin * CURVE, vx = ball.vx, vy = ball.vy;
-    ball.vx += -vy * c; ball.vy += vx * c; ball.spin *= SPIN_DECAY;
-  }
-  ball.vx *= B_DAMP; ball.vy *= B_DAMP; ball.x += ball.vx; ball.y += ball.vy;
-
-  for (let i = 0; i < players.length; i++) for (let j = i + 1; j < players.length; j++)
-    collide(players[i], players[j], PR, PR, 1, 1, 0.4);
-  for (const p of players) {
-    collide(p, ball, PR, BR, 1, 3, 0.25);
-    hitPost(p, PR, 0.2);
-    p.x = clamp(p.x, PR + 4, W - PR - 4); p.y = clamp(p.y, PR + 4, H - PR - 4);
-  }
-  // kicks: hold to kick; fires whenever the ball is in reach, with a short cooldown
-  for (const p of players) {
-    if (!p.wantKick || p.cool > 0) continue;
-    const dx = ball.x - p.x, dy = ball.y - p.y, dist = hyp(dx, dy);
-    if (dist < PR + BR + KICK_REACH && dist > 0) {
-      ball.vx += dx / dist * KICK; ball.vy += dy / dist * KICK;
-      // sideways movement across the ball at the moment of the kick adds spin
-      ball.spin = clamp((dx / dist * p.vy - dy / dist * p.vx) * 0.55, -1.6, 1.6);
-      p.cool = 14; p.kickFx = 10;
-    }
-  }
-  hitPost(ball, BR, 0.7); ballWalls();
+  for (let i = 0; i < HZ / 60; i++) physics();
 
   if (phase === 'play') {
     const scorer = ball.x < L - BR ? 1 : ball.x > R + BR ? 0 : -1;
@@ -349,16 +386,37 @@ function endMatch() {
 
 // ---------- rendering ----------
 const cv = document.getElementById('c'), ctx = cv.getContext('2d'), stage = document.getElementById('stage');
-let scale = 1;
+// camera: 'follow' zooms in and pans with the action; 'full' shows the whole pitch (toggle with C)
+const VIEW_W = 1180;                          // world units visible across the screen when following
+const cam = { x: 0, y: 0, mode: 'follow', set: false };
+let cw = 1, ch = 1, dpr = 1;
 function resize() {
-  const r = stage.getBoundingClientRect(), dpr = Math.min(devicePixelRatio || 1, 2);
-  const s = Math.min(r.width / W, r.height / H) * 0.98;
-  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
-  cv.width = Math.round(W * s * dpr); cv.height = Math.round(H * s * dpr); scale = s * dpr;
+  const r = stage.getBoundingClientRect(); dpr = Math.min(devicePixelRatio || 1, 2);
+  cw = Math.max(1, r.width - 12); ch = Math.max(1, r.height - 12);
+  cv.style.width = cw + 'px'; cv.style.height = ch + 'px';
+  cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
 }
 addEventListener('resize', resize);
+function view() {
+  const fit = Math.min(cw / W, ch / H);
+  const s = cam.mode === 'follow' ? Math.max(fit, cw / VIEW_W) : fit;
+  const vw = cw / s, vh = ch / s;
+  // look at a point between your player and the ball (just the ball when watching)
+  let tx = CX, ty = CY;
+  if (cam.mode === 'follow' && ball && phase !== 'menu') {
+    const f = human || ball;
+    tx = f.x * 0.55 + ball.x * 0.45 + ball.vx * 0.12; ty = f.y * 0.55 + ball.y * 0.45 + ball.vy * 0.12;
+  }
+  tx = vw >= W ? CX : clamp(tx, vw / 2, W - vw / 2); ty = vh >= H ? CY : clamp(ty, vh / 2, H - vh / 2);
+  if (!cam.set) { cam.x = tx; cam.y = ty; cam.set = true; }
+  cam.x += (tx - cam.x) * 0.07; cam.y += (ty - cam.y) * 0.07;
+  return s;
+}
 function draw() {
-  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  const s = view();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#1c4a23'; ctx.fillRect(0, 0, cw, ch);
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, (cw / 2 - cam.x * s) * dpr, (ch / 2 - cam.y * s) * dpr);
   ctx.fillStyle = '#245c2c'; ctx.fillRect(0, 0, W, H);
   ctx.save(); ctx.beginPath(); ctx.roundRect(L, T, PW, PH, CR); ctx.clip();
   for (let i = 0; i < 10; i++) { ctx.fillStyle = i % 2 ? '#2e7d32' : '#2a7230'; ctx.fillRect(L + i * PW / 10, T, PW / 10, PH); }
@@ -366,8 +424,8 @@ function draw() {
   ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.roundRect(L, T, PW, PH, CR); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(CX, T); ctx.lineTo(CX, B); ctx.stroke();
-  ctx.beginPath(); ctx.arc(CX, CY, 89, 0, 7); ctx.stroke();
-  ctx.strokeRect(L, CY - 154, 156, 308); ctx.strokeRect(R - 156, CY - 154, 156, 308);
+  ctx.beginPath(); ctx.arc(CX, CY, PH * 0.16, 0, 7); ctx.stroke();
+  ctx.strokeRect(L, CY - PH * 0.29, PW * 0.14, PH * 0.58); ctx.strokeRect(R - PW * 0.14, CY - PH * 0.29, PW * 0.14, PH * 0.58);
   // goals
   for (const s of [-1, 1]) {
     const x = s < 0 ? L - GOAL_D : R;
@@ -378,14 +436,14 @@ function draw() {
   // players
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = 'bold 15px system-ui,sans-serif';
   for (const p of players) {
-    if (p.boostFx > 0) { ctx.strokeStyle = `rgba(255,255,255,${p.boostFx / 20})`; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 7, p.y - p.vy * 7); ctx.stroke(); }
+    if (p.boostFx > 0) { ctx.strokeStyle = `rgba(255,255,255,${p.boostFx / 20})`; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 0.1, p.y - p.vy * 0.1); ctx.stroke(); }
     ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.ellipse(p.x + 2, p.y + 4, PR, PR * 0.85, 0, 0, 7); ctx.fill();
     ctx.fillStyle = p.team ? '#42a5f5' : '#ef5350'; ctx.beginPath(); ctx.arc(p.x, p.y, PR, 0, 7); ctx.fill();
     ctx.lineWidth = p.kickFx > 0 ? 4 : 2.5; ctx.strokeStyle = p.kickFx > 0 ? '#fff' : (p.human ? '#ffd54f' : 'rgba(0,0,0,.55)'); ctx.stroke();
     ctx.fillStyle = '#fff'; ctx.fillText(p.human ? 'YOU' : String(p.idx + 1), p.x, p.y + 1);
     if (p.human) {
       for (let i = 0; i < BOOSTS; i++) {                           // boost pips; the next one fills as it recharges
-        const f = i < p.boosts ? 1 : i === p.boosts ? p.boostT / BOOST_RECHARGE : 0;
+        const f = i < p.boosts ? 1 : i === p.boosts ? p.boostT / BOOST_REGEN : 0;
         ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(p.x - 17 + i * 12, p.y - PR - 10, 10, 4);
         ctx.fillStyle = '#ffd54f'; ctx.fillRect(p.x - 17 + i * 12, p.y - PR - 10, 10 * f, 4);
       }
@@ -399,7 +457,7 @@ function draw() {
   }
   if (phase === 'countdown' && !paused) {
     ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.font = 'bold 72px system-ui,sans-serif';
-    ctx.fillText(String(Math.ceil(phaseT / 30)), CX, CY - 110);
+    ctx.fillText(String(Math.ceil(phaseT / 30)), CX, CY - PH * 0.22);
   }
 }
 
@@ -417,6 +475,7 @@ document.querySelectorAll('.seg').forEach(seg => seg.addEventListener('click', e
   seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
   const k = seg.dataset.opt; opts[k] = k === 'mode' ? b.dataset.v : +b.dataset.v;
 }));
+$('camBtn').addEventListener('click', e => { cam.mode = cam.mode === 'follow' ? 'full' : 'follow'; e.currentTarget.blur(); });
 $('start').addEventListener('click', () => { $('menu').classList.add('hidden'); newMatch(); });
 
 // touch: left half = virtual stick, right half = kick
@@ -442,9 +501,9 @@ function frame(now) {
   draw(); requestAnimationFrame(frame);
 }
 // test hook: fast-forward the simulation
-window.__kick = { opts, start: newMatch, sim: n => { for (let i = 0; i < n; i++) step(tick++); return { score, phase, timeLeft }; } };
+window.__kick = { opts, cam, get ball() { return ball; }, get players() { return players; }, start: newMatch, sim: n => { for (let i = 0; i < n; i++) step(tick++); return { score, phase, timeLeft }; } };
 
-phase = 'menu'; resetPositions(); resize(); updateHud(); requestAnimationFrame(frame);
+phase = 'menu'; setField(opts.size); resetPositions(); resize(); updateHud(); requestAnimationFrame(frame);
 })();
 </script>
 </body>
